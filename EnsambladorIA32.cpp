@@ -12,9 +12,26 @@ using namespace std;
 // Inicialización
 // -----------------------------------------------------------------------------
 
-EnsambladorIA32::EnsambladorIA32() : contador_posicion(0) {
+//Se inicializa bandera para dos pasadas
+EnsambladorIA32::EnsambladorIA32() : contador_posicion(0), primera_pasada(true){
     inicializar_mapas();
 }
+
+//Nueva función para dos pasadas
+void EnsambladorIA32::leer_fuente(const string& archivo) {
+    lineas_fuente.clear();
+    ifstream f(archivo);
+    if (!f.is_open()) {
+        cerr << "No se pudo abrir el archivo: " << archivo << endl;
+        return;
+    }
+    string linea;
+    while (getline(f, linea)) {
+        lineas_fuente.push_back(linea);
+    }
+    f.close();
+}
+
 
 void EnsambladorIA32::inicializar_mapas() {
     // Registros de 32 bits
@@ -172,13 +189,15 @@ bool EnsambladorIA32::procesar_mem_sib(const string& operando,
         agregar_byte(disp8);
     }
 
-    // --- 6. Referencia pendiente para la etiqueta (disp32) ---
-    // Aquí va la dirección de la etiqueta (relleno = 0 por ahora)
-    ReferenciaPendiente ref;
-    ref.posicion        = contador_posicion;
-    ref.tamano_inmediato = 4;
-    ref.tipo_salto      = 0;  // absoluto
-    referencias_pendientes[etiqueta].push_back(ref);
+    // Ahora la posición del disp32 (absolute base) es contador_posicion
+    if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion; // primer byte del disp32
+        ref.tamano_inmediato = 4;
+        ref.tipo_salto       = 0; // absoluto (dirección)
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
+
 
     agregar_dword(0);  // placeholder disp32
 
@@ -226,10 +245,14 @@ bool EnsambladorIA32::obtener_inmediato32(const string& str, uint32_t& immediate
     }
 }
 void EnsambladorIA32::agregar_byte(uint8_t byte) {
-    codigo_hex.push_back(byte);
+    // Siempre avanzamos el contador de posición
     contador_posicion += 1;
-}
 
+    // Solo en la segunda pasada guardamos el byte real
+    if (!primera_pasada) {
+        codigo_hex.push_back(byte);
+    }
+}
 bool EnsambladorIA32::obtener_reg32(const string& op, uint8_t& reg_code) {
     auto it = reg32_map.find(op);
     if (it != reg32_map.end()) {
@@ -248,18 +271,22 @@ bool EnsambladorIA32::es_etiqueta(const string& s) {
     // La línea ya está limpia y en mayúsculas
     return !s.empty() && s.back() == ':';
 }
+
+
 void EnsambladorIA32::procesar_etiqueta(const string& etiqueta_cruda) {
-       // Copiamos la etiqueta
     string etiqueta = etiqueta_cruda;
 
-    // Si termina con ':' se lo quitamos (ej. "VAR_DATA:" -> "VAR_DATA")
+    // Si termina con ':' se lo quitamos
     if (!etiqueta.empty() && etiqueta.back() == ':') {
         etiqueta.pop_back();
     }
 
-    // Guardamos SIEMPRE la etiqueta sin dos puntos
-    tabla_simbolos[etiqueta] = contador_posicion;
+    // En DOS PASADAS: solo llenar tabla en la primera
+    if (primera_pasada) {
+        tabla_simbolos[etiqueta] = contador_posicion;
+    }
 }
+
 // -----------------------------------------------------------------------------
 // Procesamiento de líneas
 // -----------------------------------------------------------------------------
@@ -680,76 +707,74 @@ void EnsambladorIA32::procesar_nop() {
     agregar_byte(0x90);
 }
 
-void EnsambladorIA32::procesar_call(string operandos) {
+void EnsambladorIA32::procesar_call(const string& operandos) {
     limpiar_linea(operandos);
     string etiqueta = operandos;
 
     agregar_byte(0xE8);  // CALL rel32
-    int posicion_referencia = contador_posicion;
+    // La posición del inmediato (disp32) es la posición actual del contador
+    // antes de escribir los 4 bytes del inmediato.
+     if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion;   // primer byte del disp32
+        ref.tamano_inmediato = 4;
+        ref.tipo_salto       = 1; // relativo
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
 
-    ReferenciaPendiente ref;
-    ref.posicion = posicion_referencia;
-    ref.tamano_inmediato = 4;
-    ref.tipo_salto = 1; // relativo
-    referencias_pendientes[etiqueta].push_back(ref);
 
     agregar_dword(0); // placeholder
 }
 
-void EnsambladorIA32::procesar_loop(string operandos) {
+void EnsambladorIA32::procesar_loop(const string& operandos) {
     limpiar_linea(operandos);
     string etiqueta = operandos;
 
     agregar_byte(0xE2); // LOOP rel8
-    int posicion_referencia = contador_posicion;
+    // Posición del byte de desplazamiento (rel8) es la posición actual
+   if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion;   // primer (y único) byte del disp8
+        ref.tamano_inmediato = 1;
+        ref.tipo_salto       = 1; // relativo
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
 
-    ReferenciaPendiente ref;
-    ref.posicion = posicion_referencia;
-    ref.tamano_inmediato = 1;  // solo 1 byte de desplazamiento
-    ref.tipo_salto = 1;        // relativo
-    referencias_pendientes[etiqueta].push_back(ref);
 
     agregar_byte(0x00); // placeholder
 }
 
-bool EnsambladorIA32::procesar_mem_simple(const std::string& operando,
+bool EnsambladorIA32::procesar_mem_simple(const string& operando,
                                           uint8_t& modrm_byte,
                                           const uint8_t reg_code,
                                           bool es_destino,
                                           uint8_t op_extension)
 {
-    std::string op = operando;
-
-    // Debe ser algo como [VAR] o [ETIQUETA]
+    string op = operando;
     if (op.size() < 3 || op.front() != '[' || op.back() != ']')
         return false;
 
-    // Quitamos los corchetes
-    op = op.substr(1, op.size() - 2); 
-
-    //Trim y limpiar
+    op = op.substr(1, op.size() - 2);
     limpiar_linea(op);
+    string etiqueta = op;
 
-    // Aquí asumimos direccionamiento absoluto [ETIQUETA]
-    std::string etiqueta = op;
-
-    uint8_t mod = 0b00;      // dirección absoluta
-    uint8_t rm  = 0b101;     // usar disp32 como base
+    uint8_t mod = 0b00;
+    uint8_t rm  = 0b101;
     uint8_t reg_field = es_destino ? op_extension : reg_code;
 
     modrm_byte = generar_modrm(mod, reg_field, rm);
     agregar_byte(modrm_byte);
 
-    // El desplazamiento (disp32) viene aquí: será la dirección de la etiqueta
-    ReferenciaPendiente ref;
-    ref.posicion         = contador_posicion;
-    ref.tamano_inmediato = 4;
-    ref.tipo_salto       = 0;    // 0 = absoluto
-    referencias_pendientes[etiqueta].push_back(ref);
+    // La posición del disp32 contador_posicion (antes de escribir 4 bytes)
+    if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion; // primer byte del disp32
+        ref.tamano_inmediato = 4;
+        ref.tipo_salto       = 0; // absoluto (dirección)
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
 
-    // Placeholder, luego se parchea en resolver_referencias_pendientes
-    agregar_dword(0);
-
+    agregar_dword(0);  // placeholder disp32
     return true;
 }
 
@@ -760,46 +785,56 @@ bool EnsambladorIA32::procesar_mem_simple(const std::string& operando,
 
 void EnsambladorIA32::procesar_jmp(const string& operandos_in) {
     string operandos = operandos_in;
-    limpiar_linea(operandos);
+    string op = operandos;
+    limpiar_linea(op);
     string etiqueta = operandos;
 
-   // Si la etiqueta ya está definida podemos elegir salto corto o cercano
+    // Caso 1: etiqueta ya definida (posiblemente en pasada 1 si está antes)
     if (tabla_simbolos.count(etiqueta)) {
         int destino = tabla_simbolos[etiqueta];
-        // calculamos offset relativo respecto al byte siguiente
-        int pos_disp = contador_posicion + 1; // si usamos EB/dispb
-        int offset = destino - pos_disp;
-        if (offset >= -128 && offset <= 127) {
-            agregar_byte(0xEB);
-            agregar_byte(static_cast<uint8_t>(offset & 0xFF));
-            return;
-    } else {
-       // usar near jump E9 rel32
-        agregar_byte(0xE9);
-        int posicion_referencia = contador_posicion;
-        ReferenciaPendiente ref;
-        ref.posicion = posicion_referencia;
-        ref.tamano_inmediato = 4;
-        ref.tipo_salto = 1; // relativo
-        referencias_pendientes[etiqueta].push_back(ref);
-        agregar_dword(0);
-        return;
-        }
-     }
-    // Si la etiqueta no existe aún, emitimos salto corto por defecto y referencia pendiente
-    // (se podría mejorar para elegir rel32 cuando se necesite)
-    agregar_byte(0xEB);
-    int pos_disp = contador_posicion;
-    
-    ReferenciaPendiente ref;
-    ref.posicion = pos_disp; // byte del disp8
-    ref.tamano_inmediato = 1;
-    ref.tipo_salto = 1; // relativo
-    referencias_pendientes[etiqueta].push_back(ref);
-    
-    agregar_byte(0x00); // placeholder
-}
 
+        // Intentamos calcular como rel8 primero (offset desde siguiente byte)
+        int pos_disp_if_short = contador_posicion + 1; // si ponemos EB xx, el disp está en contador+1
+        int offset_short = destino - pos_disp_if_short;
+
+        if (offset_short >= -128 && offset_short <= 127) {
+            // Salto corto
+            agregar_byte(0xEB); // JMP rel8
+            agregar_byte(static_cast<uint8_t>(offset_short & 0xFF));
+            return;
+        } else {
+            // Salto near rel32
+            agregar_byte(0xE9); // JMP rel32
+
+            // Registrar referencia en PASADA 1 (posición del disp32)
+            if (primera_pasada) {
+                ReferenciaPendiente ref;
+                ref.posicion         = contador_posicion; // primer byte del disp32
+                ref.tamano_inmediato = 4;
+                ref.tipo_salto       = 1; // relativo
+                referencias_pendientes[etiqueta].push_back(ref);
+            }
+
+            agregar_dword(0); // placeholder disp32
+            return;
+        }
+    }
+
+    // Caso 2: etiqueta NO existe aún (forward).
+    // Para simplificar y evitar reensamblados, emitimos aquí la forma NEAR (rel32)
+    // en lugar de asumir salto corto. Esto garantiza que la referencia tenga espacio.
+    agregar_byte(0xE9); // JMP rel32 (forward assumed)
+
+    if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion; // primer byte del disp32
+        ref.tamano_inmediato = 4;
+        ref.tipo_salto       = 1; // relativo
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
+
+    agregar_dword(0); // placeholder rel32
+}
 void EnsambladorIA32::procesar_condicional(const string& mnem,
                                            const string& operandos_in) {
     string operandos = operandos_in;
@@ -825,7 +860,7 @@ void EnsambladorIA32::procesar_condicional(const string& mnem,
         cerr << "Error: Mnemónico condicional no soportado: " << mnem << endl;
         return;
     }
-
+    // Si la etiqueta ya está en la tabla, intentamos calcular offset
     if (tabla_simbolos.count(etiqueta)) {
         int destino = tabla_simbolos[etiqueta];
         int pos_disp = contador_posicion + 1; // si emitimos short
@@ -838,28 +873,49 @@ void EnsambladorIA32::procesar_condicional(const string& mnem,
             // emitir opcode 0F 8x + rel32
             agregar_byte(0x0F);
             agregar_byte(opcode_ext);
-            int posicion_referencia = contador_posicion;
-            ReferenciaPendiente ref;
-            ref.posicion = posicion_referencia;
-            ref.tamano_inmediato = 4;
-            ref.tipo_salto = 1; // relativo
-            referencias_pendientes[etiqueta].push_back(ref);
+            
+            // registrar referencia en PASADA 1 apuntando al inicio del disp32
+            if (primera_pasada) {
+                ReferenciaPendiente ref;
+                ref.posicion         = contador_posicion; // primer byte del disp32
+                ref.tamano_inmediato = 4;
+                ref.tipo_salto       = 1; // relativo
+                referencias_pendientes[etiqueta].push_back(ref);
+            }
+
             agregar_dword(0);
             return;
         }
     }  
 
     // Si etiqueta no está definida, emitimos versión corta y referencia rel8 pendiente
-    agregar_byte(opcode);
-    int pos_disp = contador_posicion;
-    ReferenciaPendiente ref;
-    ref.posicion = pos_disp;
-    ref.tamano_inmediato = 1; // rel8
-    ref.tipo_salto = 1; // relativo
-    referencias_pendientes[etiqueta].push_back(ref);
-    agregar_byte(0x00); // placeholder
-}
+   if (uses_two_byte) {
+        agregar_byte(0x0F);
+        agregar_byte(opcode_ext);
 
+        if (primera_pasada) {
+            ReferenciaPendiente ref;
+            ref.posicion         = contador_posicion; // primer byte del disp32
+            ref.tamano_inmediato = 4;
+            ref.tipo_salto       = 1; // relativo
+            referencias_pendientes[etiqueta].push_back(ref);
+        }
+
+        agregar_dword(0);
+        return;
+    }
+
+    // Fallback (no debería llegar aquí)
+    agregar_byte(opcode);
+    if (primera_pasada) {
+        ReferenciaPendiente ref;
+        ref.posicion         = contador_posicion;
+        ref.tamano_inmediato = 1;
+        ref.tipo_salto       = 1;
+        referencias_pendientes[etiqueta].push_back(ref);
+    }
+    agregar_byte(0x00);
+}
 
 void EnsambladorIA32::procesar_mul(const string& operandos) {
     string op = operandos;
@@ -1021,20 +1077,28 @@ void EnsambladorIA32::procesar_mov(const string& operandos) {
         return;
     }
 
-    // 2.5. MOV [ETIQUETA], EAX (Opcode A3) - Usaremos SOLO para [LABEL] simple
-   if (src_is_reg && src_code == 0b000 && is_mem_simple_label(dest_str)) {
-        string temp_op = dest_str.substr(1, dest_str.size() - 2);
-        agregar_byte(0xA3);
-        
+ // 2.5. MOV [ETIQUETA], EAX (Opcode A3) - Usaremos SOLO para [LABEL] simple
+if (src_is_reg && src_code == 0b000 && is_mem_simple_label(dest_str)) {
+    // dest_str viene como "[RESULTADO]" por ejemplo
+    string temp_op = dest_str.substr(1, dest_str.size() - 2); // "RESULTADO"
+
+    agregar_byte(0xA3);  // MOV [disp32], EAX
+
+    // Registrar la referencia en la PRIMERA pasada (antes era en !primera_pasada)
+    if (primera_pasada) {
         ReferenciaPendiente ref;
-        ref.posicion = contador_posicion;
+        ref.posicion         = contador_posicion; // donde empieza el disp32
         ref.tamano_inmediato = 4;
-        ref.tipo_salto = 0;
+        ref.tipo_salto       = 0; // 0 = absoluto (dirección)
         referencias_pendientes[temp_op].push_back(ref);
-        
-        agregar_dword(0);
-        return;
     }
+
+    // Reserva 4 bytes (en 2ª pasada escribe 00 00 00 00)
+    agregar_dword(0);
+
+    return;
+}
+
     
     // 3. MOV [MEM], REG (89 r/m32, r32). MEMORIA ES DESTINO.
     if (src_is_reg) {
@@ -1290,18 +1354,55 @@ void EnsambladorIA32::resolver_referencias_pendientes() {
 // -----------------------------------------------------------------------------
 
 void EnsambladorIA32::ensamblar(const string& archivo_entrada) {
-    ifstream f(archivo_entrada);
-    if (!f.is_open()) {
-        cerr << "No se pudo abrir el archivo: " << archivo_entrada << endl;
+    // 1) Leer el archivo SOLO UNA VEZ
+    leer_fuente(archivo_entrada);
+    if (lineas_fuente.empty()) {
+        cerr << "No se leyo ninguna linea de " << archivo_entrada << endl;
         return;
     }
 
-    string linea;
-    while (getline(f, linea)) {
+    // -----------------------------------------------------------------
+    // PASADA 1: solo construir tabla de símbolos y contar bytes
+    // -----------------------------------------------------------------
+    cout << "=== PASADA 1: construyendo tabla de simbolos ===\n";
+
+    primera_pasada      = true;
+    contador_posicion   = 0;
+    tabla_simbolos.clear();
+    referencias_pendientes.clear();
+    codigo_hex.clear();          
+
+    for (auto linea : lineas_fuente) {
         procesar_linea(linea);
     }
 
-    f.close();
+    cout << "Fin PASADA 1. Bytes contados = " << contador_posicion << "\n";
+    cout << "Simbolos encontrados:\n";
+    for (const auto& par : tabla_simbolos) {
+        cout << "  " << par.first << " -> " << par.second << "\n";
+    }
+
+    // -----------------------------------------------------------------
+    // PASADA 2: generar el código máquina real
+    // -----------------------------------------------------------------
+    cout << "=== PASADA 2: generando codigo maquina ===\n";
+
+    primera_pasada      = false;
+    contador_posicion   = 0;
+    // NOTA: NO limpiamos referencias_pendientes: las referencias detectadas
+    // en la primera pasada deben conservarse para ser resueltas tras generar bytes.
+    // referencias_pendientes.clear(); // <-- Eliminado intencionalmente
+    codigo_hex.clear();
+
+    for (auto linea : lineas_fuente) {
+        procesar_linea(linea);
+    }
+
+    // Después de generar los bytes en segunda pasada, resolvemos las referencias
+    cout << "Resolviendo referencias pendientes...\n";
+    resolver_referencias_pendientes();
+
+    cout << "Fin PASADA 2. Bytes generados = " << contador_posicion << "\n";
 }
 
 void EnsambladorIA32::generar_hex(const string& archivo_salida) {
@@ -1357,11 +1458,8 @@ void EnsambladorIA32::generar_reportes() {
 int main() {
     EnsambladorIA32 ensamblador;
 
-    cout << "Iniciando ensamblado en una sola pasada (leyendo programa.asm)...\n";
-    ensamblador.ensamblar("programa.asm");
-
-    cout << "Resolviendo referencias pendientes...\n";
-    ensamblador.resolver_referencias_pendientes();
+    cout << "Iniciando ensamblado en DOS pasadas (leyendo programa.asm)...\n";
+    ensamblador.ensamblar("programa.asm");   //
 
     cout << "Generando programa.hex, simbolos.txt y referencias.txt...\n";
     ensamblador.generar_hex("programa.hex");
@@ -1370,5 +1468,11 @@ int main() {
     cout << "Proceso finalizado correctamente. Revisa los archivos generados.\n";
     return 0;
 }
+
+
+
+
+
+
 
 
